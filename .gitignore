@@ -1,0 +1,9 @@
+GOF.GRB.FM14.*.txt
+*.zip
+ESTRUC CINTA POS DEPOS FINAL V3.xlsx
+ejemplo estructura.xlsx
+ejemplo_datos.xlsx
+__pycache__/
+*.pyc
+salidas/
+logs/
