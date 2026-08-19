@@ -62,17 +62,20 @@ Decisiones de diseño clave:
 
 Definido en `src/config.py:24-83` como una lista de 55 dicts `{"nombre", "inicio", "longitud"}`. `inicio` es 1-indexado (posición del carácter) y `longitud` es la cantidad de caracteres que ocupa el campo (no una posición final).
 
-Fórmula de parseo (`src/lector.py`, dentro de `construir_dataframe`): equivale exactamente a un `MID(texto, inicio, longitud)` de Excel — mismas posiciones, `inicio - 1` como offset 0-indexado. Desde la optimización de rendimiento para archivos de 800 mil a 1 millón de filas, la extracción ya no es un bucle Python campo por campo por línea (`linea[inicio-1:inicio-1+longitud].strip()` dentro de un `for` sobre `lineas`, con 55 slices/dict-inserts por fila) sino `pandas.read_fwf` con `colspecs` derivados de `LAYOUT` (`(inicio-1, inicio-1+longitud)` por campo) y `dtype=str` para no perder ceros a la izquierda ni inferir tipos:
+Fórmula de parseo (`src/lector.py`, dentro de `construir_dataframe`): equivale exactamente a un `MID(texto, inicio, longitud)` de Excel — mismas posiciones, `inicio - 1` como offset 0-indexado. Desde la optimización de rendimiento para archivos de 800 mil a 1 millón de filas, la extracción ya no es un bucle Python campo por campo por línea (`linea[inicio-1:inicio-1+longitud].strip()` dentro de un `for` sobre `lineas`, con 55 slices/dict-inserts por fila) sino slicing vectorizado de pandas (`Series.str.slice`) sobre todas las líneas a la vez, una columna completa por campo:
 
 ```python
-colspecs = [(c["inicio"] - 1, c["inicio"] - 1 + c["longitud"]) for c in LAYOUT]
-df = pd.read_fwf(io.StringIO("\n".join(lineas)), colspecs=colspecs, names=nombres, dtype=str, header=None)
-df = df.fillna("")               # línea más corta que un colspec -> NaN, no error; se normaliza a "" igual que el slicing manual
-for nombre in nombres:
-    df[nombre] = df[nombre].str.strip()
+serie = pd.Series(lineas)
+columnas = {
+    campo["nombre"]: serie.str.slice(
+        campo["inicio"] - 1, campo["inicio"] - 1 + campo["longitud"]
+    ).str.strip()
+    for campo in LAYOUT
+}
+df = pd.DataFrame(columnas)
 ```
 
-El parser de ancho fijo de pandas está acelerado en C, así que reemplaza el costo dominante del pipeline completo (el bucle Python de 55 campos × N filas) por una operación vectorizada. Semántica idéntica al slicing manual: mismas posiciones, `colspecs` solapados entre sí siguen funcionando igual (ver nota de `DISPOSITIVO`/`PLANO` en la sección de campos), y una línea más corta que lo esperado produce campo vacío (antes por slicing fuera de rango, ahora por `NaN` normalizado con `fillna("")`) en vez de un error. Todo se guarda como `str` — **`src/lector.py` no convierte tipos**; eso se hace explícitamente campo a campo en `src/reglas.py`, para mantener control total sobre el formato real.
+`Series.str.slice` reemplaza el costo dominante del pipeline completo (el bucle Python de 55 campos × N filas, con ~50 objetos dict creados por línea) por 55 operaciones vectorizadas — una por campo, sobre la columna completa — dejando que pandas construya el DataFrame columna por columna en vez de a partir de una lista de dicts fila por fila. Semántica idéntica al slicing manual byte a byte: mismas posiciones, `colspecs` solapados entre sí siguen funcionando igual (ver nota de `DISPOSITIVO`/`PLANO` en la sección de campos), y una línea más corta que lo esperado produce campo vacío (`str.slice` sobre una cadena corta devuelve lo que alcance, igual que el slicing nativo de Python — nunca `NaN`, así que no hace falta ningún `fillna` especial). También maneja `lineas == []` sin caso especial: `pd.Series([])` seguido de `.str.slice(...).str.strip()` produce columnas vacías sin error. Todo se guarda como `str` — **`src/lector.py` no convierte tipos**; eso se hace explícitamente campo a campo en `src/reglas.py`, para mantener control total sobre el formato real.
 
 ### Los 55 campos
 
@@ -268,24 +271,14 @@ Aplicado a las funciones públicas: `leer_lineas`, `construir_dataframe`, `gener
 
 ## 6. Generación de Excel (`src/exportador.py`)
 
-`guardar_con_formato(path, hojas)` crea un `openpyxl.Workbook` manual (no `pd.ExcelWriter`) y elige uno de dos modos según el contenido de `hojas`:
+`guardar_con_formato(path, hojas)` crea un único `openpyxl.Workbook(write_only=True)` (no `pd.ExcelWriter`, no un `Workbook` normal) para **todas** las hojas, sean `pd.DataFrame` (`_escribir_hoja_dataframe`) o de posición libre (`_escribir_hoja_libre`). El modo `write_only` transmite cada fila directamente al XML de salida sin mantener el worksheet completo en memoria — mucho más rápido y liviano con hojas de cientos de miles de filas que `DataFrame.to_excel(engine="openpyxl")`, que asigna celda por celda (`ws.cell(row, col, value)` una vez por cada una de las ~55 columnas × cada fila).
 
-- **Todas las hojas son `pd.DataFrame`** (caso real de Archivo 1 y Archivo 2, que nunca traen la hoja de posición libre): `Workbook(write_only=True)` + `_escribir_dataframe_write_only(ws, df)` por cada hoja.
-- **Alguna hoja es de posición libre** (caso de Archivo 3, que mezcla "Hoja1" con `pd.DataFrame`): `Workbook()` normal, con `_formatear_hoja(ws, df)` para las hojas DataFrame y `_escribir_hoja_libre(ws, celdas)` para la de posición libre — `write_only` solo admite escritura secuencial por fila (`ws.append(...)`), no asignación aleatoria de celdas (`ws["D3"] = valor`), así que no sirve para "Hoja1".
+La contrapartida de `write_only` es que **no admite acceso aleatorio a celdas** (`ws["D3"] = valor`, usado antes para la hoja de posición libre "Hoja1" de Archivo 3) ni volver a tocar una fila ya escrita — se serializa en cuanto se hace `ws.append()`. Por eso:
+- El encabezado y el formato de moneda/fecha se arman **antes** de cada `append`, envolviendo el valor en `openpyxl.cell.WriteOnlyCell` (con `.fill`/`.font`/`.alignment` para el encabezado, `.number_format` para moneda/fecha) en vez de asignarlos después.
+- `freeze_panes` y `column_dimensions` también deben fijarse **antes** del primer `append` de cada hoja — verificado en la versión de openpyxl usada en este proyecto: asignados después del primer `append`, se ignoran silenciosamente (sin error, pero no se guardan en el `.xlsx`).
+- **`_escribir_hoja_libre`** arma una grilla completa en memoria (`list[list]`, de la fila 1 a la última fila usada, columna A a la última columna usada, con `None` en las posiciones sin celda definida) a partir de la lista de celdas de posición libre, y la vuelca fila por fila con `ws.append(fila)` — las columnas conservan su letra real (D, E, F...) para que la plantilla replicada (ver `_layout_valor_cinta` en `src/reglas.py`) no cambie de posición. Esto permite que hasta "Hoja1" (no tabular) también use `write_only`, sin necesitar un `Workbook` normal como camino alternativo.
 
-Ambos caminos reemplazan `DataFrame.to_excel(engine="openpyxl")`, que internamente asigna celda por celda (`ws.cell(row, col, value)` una vez por cada una de las ~55 columnas × cada fila) — con cientos de miles de filas ese es el cuello de botella real de la generación de reportes. En su lugar se escribe cada fila completa con `ws.append(fila)`, iterando el DataFrame con `df.itertuples(index=False, name=None)` (más rápido que `iterrows()`). El encabezado, el ancho de columna y el formato de moneda/fecha se calculan en el mismo recorrido, no en pasadas adicionales sobre todo el DataFrame:
-- Columnas moneda (`"monto"`/`"valor"` en el nombre, minúsculas) → formato `#,##0.00`, ancho fijo 18.
-- Columnas fecha (`"fecha"` en el nombre) → formato `DD/MM/YYYY`, ancho fijo 12.
-- El resto de columnas → ancho estimado con una **muestra** de las primeras 2000 filas (`df.head(2000)`), no con `df` completo — evita el recorrido `astype(str).map(len)` sobre cientos de miles de filas solo para calcular un ancho visual; el ancho es una aproximación cosmética, no afecta los datos.
-- `NaN`/`NaT` (ej. `MONTO-1` con `pd.to_numeric(..., errors="coerce")` sobre datos malformados) se normalizan a `None` con `df.where(pd.notnull(df), None)` antes de escribir — openpyxl no acepta `NaN` como valor de celda; `to_excel` lo hacía automáticamente y había que replicarlo explícitamente.
-
-**`_formatear_hoja`** (Workbook normal): tras cada `ws.append(fila)` puede volver a tocar la celda ya escrita, así que el formato de moneda/fecha se aplica justo después con `ws.cell(row, col).number_format = ...` (solo a las 1-3 columnas marcadas, no a las 55), en vez de un segundo recorrido completo con `ws.iter_rows()` al final.
-
-**`_escribir_dataframe_write_only`** (Workbook write_only): en este modo cada fila se serializa al XML de salida en cuanto se hace `ws.append()` y ya no se puede volver a tocar — no existe una "celda ya escrita" a la que regresar. Por eso el encabezado y el formato de moneda/fecha se arman **antes** de cada `append`, envolviendo el valor en `openpyxl.cell.WriteOnlyCell` (con `.fill`/`.font`/`.alignment` para el encabezado, `.number_format` para moneda/fecha) en vez de asignarlos después. `freeze_panes` y `column_dimensions` también deben fijarse **antes** del primer `append` — verificado en openpyxl 3.1.5: asignados después del primer `append`, se ignoran silenciosamente (sin error, pero no se guardan en el `.xlsx`).
-
-Motivo del modo `write_only`: un `Workbook` normal retiene todos los objetos `Cell` en memoria; con archivos de hasta 1 millón de filas concentradas en pocas hojas grandes (ej. "TIPO 50", "TIPO 12-15"), eso degrada el rendimiento de forma no lineal — medido en el benchmark de esta sesión (1,000,000 de filas sintéticas), la hoja "RECH EP" (~584 mil filas combinando sus dos hojas) tardaba 367.62s con `Workbook` normal vs 185.77s con `write_only` (~2× más rápido), mientras que "TIPO 50"+"TIPO 01" (~195 mil filas) bajó de 70.11s a 62.39s — la ganancia crece con el tamaño de la hoja porque `write_only` no acumula memoria proporcional al número de filas.
-
-**`_escribir_hoja_libre`** (hojas de layout libre): escribe cada celda por referencia `f"{columna}{fila}"`, aplica negrita/formato de número según el dict, y fija ancho 24 a las columnas usadas. Solo se usa dentro del camino de `Workbook` normal.
+**`_escribir_hoja_dataframe`**: `_clasificar_columnas(df)` determina, por nombre de columna, qué formato de número aplica (`"monto"`/`"valor"` en el nombre, minúsculas → `#,##0.00`; `"fecha"` → `DD/MM/YYYY`); `_anchos_columnas(df)` calcula el ancho de cada columna recorriendo el DataFrame completo con `df[col].fillna("").astype(str).map(len).max()`. El `fillna("")` antes de `astype(str)` es necesario porque, en pandas 3.x (la versión instalada en este entorno), `astype(str)` sobre un `NaN` de una columna `float64` (ej. `MONTO-1` cuando `pd.to_numeric(..., errors="coerce")` no pudo convertir el valor) **ya no produce la cadena `"nan"`** como en pandas < 3 — deja el `NaN` como `float`, y `.map(len)` revienta con `TypeError: object of type 'float' has no len()`; esto rompía la generación de cualquier hoja con al menos una fila cuyo `MONTO-1` no se pudo convertir, un caso real y común (filas con el campo en blanco). Los valores de fila se preparan con `df.astype(object).where(df.notna(), None).values.tolist()` (`NaN`/`NaT` → `None`, porque openpyxl no acepta `NaN` como valor de celda) y se escriben con `ws.append(fila)`, envolviendo en `WriteOnlyCell` solo las celdas de columnas con formato asignado.
 
 **Hojas vacías**: se escriben igual (con encabezados), pero se advierte en consola y en el log por cada una — no aborta la generación.
 
@@ -299,31 +292,31 @@ Usan la fecha del **sistema al momento de ejecutar**, no la fecha del archivo pl
 
 ## 6b. Rendimiento con archivos grandes (800 mil - 1 millón de filas)
 
-El pipeline fue optimizado en esta sesión para que un archivo plano de 800 mil a 1 millón de filas se procese en minutos, no en decenas de minutos, **sin tocar ninguna regla de negocio ni filtro** — los cambios son puramente de cómo se parsea el archivo y cómo se escribe el Excel, no de qué filas o valores calcula el programa.
+El pipeline fue optimizado para que un archivo plano de 800 mil a 1 millón de filas se procese en minutos, no en decenas de minutos, **sin tocar ninguna regla de negocio ni filtro** — los cambios son puramente de cómo se parsea el archivo y cómo se escribe el Excel, no de qué filas o valores calcula el programa. Esta optimización se hizo en dos rondas independientes (una local, otra subida directamente al remoto) que llegaron a la misma idea general por caminos distintos; se resolvió el conflicto de fusión quedándose con la versión del remoto por ser más simple, y corrigiendo en el proceso un bug real de compatibilidad con pandas 3.x que esa versión tenía (ver sección 6).
 
 Los dos cuellos de botella reales, identificados y corregidos:
 
-1. **Parseo del archivo plano** (`src/lector.py:construir_dataframe`): antes era un bucle Python que, por cada línea, hacía 55 slices + `.strip()` + inserciones en un dict — con 1 millón de filas, 55 millones de operaciones a nivel de bytecode Python. Se reemplazó por `pandas.read_fwf` (parser de ancho fijo acelerado en C) sobre las mismas posiciones (`colspecs`), con `dtype=str` para preservar ceros a la izquierda y evitar inferencia de tipo. Ver sección 2.
-2. **Escritura del Excel** (`src/exportador.py:guardar_con_formato`): antes usaba `DataFrame.to_excel(engine="openpyxl")`, que asigna celda por celda (`ws.cell(row, col, value)` por cada una de las ~55 columnas × cada fila), más un recorrido `astype(str).map(len)` sobre columnas completas solo para calcular el ancho de columna, más un segundo recorrido completo con `ws.iter_rows()` para aplicar el formato de moneda/fecha. Se reemplazó por escritura fila-por-fila con `ws.append()`, con ancho de columna estimado por muestra y formato aplicado en el mismo recorrido — y, cuando el archivo de salida no mezcla la hoja de posición libre de Archivo 3 (es decir, siempre en Archivo 1 y Archivo 2), por `Workbook(write_only=True)`, que no retiene los objetos `Cell` en memoria y escala linealmente en vez de degradarse con hojas grandes. Ver sección 6.
+1. **Parseo del archivo plano** (`src/lector.py:construir_dataframe`): antes era un bucle Python que, por cada línea, hacía 55 slices + `.strip()` + inserciones en un dict — con 1 millón de filas, 55 millones de operaciones a nivel de bytecode Python. Se reemplazó por slicing vectorizado de pandas (`Series.str.slice` sobre la columna completa de líneas, una vez por campo). Ver sección 2.
+2. **Escritura del Excel** (`src/exportador.py:guardar_con_formato`): antes usaba `DataFrame.to_excel(engine="openpyxl")`, que asigna celda por celda (`ws.cell(row, col, value)` por cada una de las ~55 columnas × cada fila), más un recorrido `astype(str).map(len)` sobre columnas completas solo para calcular el ancho de columna, más un segundo recorrido completo con `ws.iter_rows()` para aplicar el formato de moneda/fecha. Se reemplazó por `openpyxl.Workbook(write_only=True)` con escritura fila-por-fila vía `ws.append()`, que no retiene los objetos `Cell` en memoria y escala mejor que un `Workbook` normal con hojas grandes. Ver sección 6.
 
-**Benchmark** (1,000,000 de filas sintéticas, distribución pareja entre categorías — máquina de esta sesión, no representa necesariamente el hardware de producción):
+**Benchmark** (1,000,000 de filas sintéticas, distribución pareja entre categorías — máquina de esta sesión, no representa necesariamente el hardware de producción; medido con la versión final del código, después de fusionar ambas rondas de optimización y corregir el bug de `_anchos_columnas`):
 
 | Paso | Tiempo |
 |---|---|
-| `construir_dataframe` (parseo) | ~27s |
-| `generar_archivo_1` (reglas) + escritura ("TIPO 50": 111,207 filas, "TIPO 01": 83,492 filas) | ~1s + ~62s |
-| `generar_archivo_2` (reglas) + escritura ("TIPO 12-15": 333,705 filas, "RECH EP": 250,438 filas) | ~1s + ~186s |
+| `construir_dataframe` (parseo, `Series.str.slice`) | ~16s |
+| `generar_archivo_1` (reglas) + escritura ("TIPO 50": 111,207 filas, "TIPO 01": 83,492 filas) | ~1s + ~59s |
+| `generar_archivo_2` (reglas) + escritura ("TIPO 12-15": 333,705 filas, "RECH EP": 250,438 filas) | ~1s + ~179s |
 | `generar_archivo_3` (reglas) + escritura (VALOR CINTA, tablas pequeñas) | ~2s + <1s |
-| **Total (parseo + los 3 archivos)** | **~280s ≈ 4.7 min** |
+| **Total (parseo + los 3 archivos)** | **~259s ≈ 4.3 min** |
 
-Antes de esta optimización, el mismo benchmark (con `Workbook` normal en vez de `write_only`, y el parseo en bucle Python) medía **~471s ≈ 7.8 min** solo con la primera mitad de la optimización (parseo + escritura ya reescrita a `ws.append()` pero sin `write_only`); el parseo en bucle Python puro original (nunca medido de punta a punta en esta sesión por ser evidentemente más lento en ambos pasos) es la explicación más probable de los ~30 minutos reportados en producción. Con archivos reales de producción, donde las categorías de `TIPO-REGISTRO` no se reparten parejo entre 6 valores (una sola categoría puede concentrar la mayoría de las filas), la mejora de `write_only` es la que más importa: su ventaja crece con el tamaño de la hoja en vez de degradarse.
+Con archivos reales de producción, donde las categorías de `TIPO-REGISTRO` no se reparten parejo entre 6 valores (una sola categoría puede concentrar la mayoría de las filas), la mejora de `write_only` es la que más importa: su ventaja crece con el tamaño de la hoja en vez de degradarse, a diferencia de un `Workbook` normal que retiene todas las celdas en memoria.
 
 ## 7. Dependencias externas
 
 | Paquete | Usado en | Propósito |
 |---|---|---|
-| `pandas` | `main.py`, `src/lector.py`, `src/reglas.py`, `src/exportador.py` | DataFrame, `concat`, `to_numeric`, `read_fwf` |
-| `openpyxl` | `src/exportador.py` | `Workbook`/`Workbook(write_only=True)`, `WriteOnlyCell`, estilos manuales |
+| `pandas` | `main.py`, `src/lector.py`, `src/reglas.py`, `src/exportador.py` | DataFrame, `concat`, `to_numeric`, `Series.str.slice` |
+| `openpyxl` | `src/exportador.py` | `Workbook(write_only=True)`, `WriteOnlyCell`, estilos manuales |
 | `tkinter` (stdlib, import opcional con fallback) | `src/validador.py` | Diálogo de selección múltiple de archivos |
 
 Resto: módulos estándar (`pathlib`, `datetime`, `re`, `typing`, `functools`, `logging`, `os`). No existe `requirements.txt`, `pyproject.toml` ni `.gitignore` en la raíz — las dependencias (`pandas`, `openpyxl`) deben instalarse manualmente en el entorno Python que ejecuta el programa (`tkinter` viene con la instalación estándar de Python en Windows).
