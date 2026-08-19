@@ -32,14 +32,20 @@ def construir_dataframe(lineas: list) -> pd.DataFrame:
     Todo se trae como texto (str) y se limpia (strip); las conversiones
     de tipo (fecha, numérico) se hacen explícitamente en reglas.py,
     campo por campo, para mantener control total sobre el formato real.
-    """
-    registros = []
-    for linea in lineas:
-        registro = {
-            campo["nombre"]: linea[campo["inicio"] - 1: campo["inicio"] - 1 + campo["longitud"]].strip()
-            for campo in LAYOUT
-        }
-        registros.append(registro)
 
-    df = pd.DataFrame(registros)
-    return df
+    Extrae cada campo con slicing vectorizado (Series.str.slice) sobre
+    todas las líneas a la vez, en lugar de armar un dict por línea con un
+    loop en Python puro: con archivos de cientos de miles de líneas, esto
+    evita crear ~50 objetos dict por línea y deja que pandas construya el
+    DataFrame columna por columna (mucho más barato que a partir de una
+    lista de dicts fila por fila). El resultado es idéntico byte a byte
+    al de la versión fila por fila.
+    """
+    serie = pd.Series(lineas)
+    columnas = {
+        campo["nombre"]: serie.str.slice(
+            campo["inicio"] - 1, campo["inicio"] - 1 + campo["longitud"]
+        ).str.strip()
+        for campo in LAYOUT
+    }
+    return pd.DataFrame(columnas)
