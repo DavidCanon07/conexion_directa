@@ -174,6 +174,20 @@ is unaware of file boundaries, only of the `"__dia"` column.
   DataFrame sheet from any of the 3 archivos) — Excel's real limit is
   1,048,576 rows/sheet. This is a generic export-layer safeguard, not a
   business rule — don't move it into `reglas.py`.
+- **`_escribir_hoja_dataframe` only wraps cells in `WriteOnlyCell` for the
+  columns in `indices_formato`** (precomputed once per sheet — normally
+  `MONTO-1` plus any `"fecha"`-named column), not all ~55 columns per row.
+  When adding a new formatted-column heuristic to `_clasificar_columnas`,
+  keep this pattern — looping every column per row is the real cost at
+  multi-million-row scale (consolidating 3-4 flat files of ~1M rows each).
+  `_anchos_columnas` similarly samples the first 2000 rows
+  (`_FILAS_MUESTRA_ANCHO`) instead of scanning the full DataFrame.
+- **`main.py` prints a `HH:MM:SS` timestamp when reading starts and again
+  right before "Aplicando reglas de negocio..."** (the moment filtering
+  begins), plus elapsed time (`time.perf_counter()`) at the end of parsing
+  and of each `opcion_generar_archivo_N()` — visible in the console
+  without opening the log, for tracking how long large consolidated runs
+  take.
 - Large `*.txt` files at the repo root (`GOF.GRB.FM14.F260813.txt`,
   `GOF.GRB.FM14.F260814.txt` — real production naming, days 13/14) are
   sample flat-file inputs for manual testing, ~130+ MB each — don't read

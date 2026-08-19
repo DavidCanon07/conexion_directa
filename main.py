@@ -19,6 +19,8 @@ Todo el flujo pasa por manejar_errores en cada módulo: un fallo puntual
 """
 
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -81,6 +83,9 @@ def _construir_dataframe_base():
         pausar()
         return None
 
+    inicio = time.perf_counter()
+    print(f"\n[{datetime.now():%H:%M:%S}] Iniciando lectura de {len(estado['rutas'])} archivo(s)...")
+
     partes = []
     for ruta in estado["rutas"]:
         dia = extraer_dia(ruta)
@@ -111,7 +116,8 @@ def _construir_dataframe_base():
     print("\nConstruyendo tabla base combinada...")
     df = pd.concat(partes, ignore_index=True)
     estado["df"] = df
-    print(f"Tabla base construida: {len(df)} filas, {df['__dia'].nunique()} día(s).")
+    duracion = time.perf_counter() - inicio
+    print(f"Tabla base construida: {len(df)} filas, {df['__dia'].nunique()} día(s) — lectura y parseo: {duracion:.1f}s.")
     return df
 
 
@@ -120,7 +126,8 @@ def opcion_generar_archivo_1():
     if df is None:
         return
 
-    print("\nAplicando reglas de negocio (Archivo 1)...")
+    inicio = time.perf_counter()
+    print(f"\n[{datetime.now():%H:%M:%S}] Aplicando reglas de negocio (Archivo 1)...")
     hojas = generar_archivo_1(df)
     if hojas is None:
         pausar()
@@ -131,7 +138,8 @@ def opcion_generar_archivo_1():
         pausar()
         return
 
-    print("\n[OK] Archivo 1 generado.")
+    duracion = time.perf_counter() - inicio
+    print(f"\n[OK] Archivo 1 generado en {duracion:.1f}s.")
     pausar()
 
 
@@ -140,7 +148,8 @@ def opcion_generar_archivo_2():
     if df is None:
         return
 
-    print("\nAplicando reglas de negocio (Archivo 2)...")
+    inicio = time.perf_counter()
+    print(f"\n[{datetime.now():%H:%M:%S}] Aplicando reglas de negocio (Archivo 2)...")
     hojas = generar_archivo_2(df)
     if hojas is None:
         pausar()
@@ -151,7 +160,8 @@ def opcion_generar_archivo_2():
         pausar()
         return
 
-    print("\n[OK] Archivo 2 generado.")
+    duracion = time.perf_counter() - inicio
+    print(f"\n[OK] Archivo 2 generado en {duracion:.1f}s.")
     pausar()
 
 
@@ -160,7 +170,8 @@ def opcion_generar_archivo_3():
     if df is None:
         return
 
-    print("\nAplicando reglas de negocio (Archivo 3)...")
+    inicio = time.perf_counter()
+    print(f"\n[{datetime.now():%H:%M:%S}] Aplicando reglas de negocio (Archivo 3)...")
     hojas = generar_archivo_3(df)  # sobre el universo completo, no sobre 1 ni 2
     if hojas is None:
         pausar()
@@ -171,7 +182,8 @@ def opcion_generar_archivo_3():
         pausar()
         return
 
-    print("\n[OK] Archivo 3 generado.")
+    duracion = time.perf_counter() - inicio
+    print(f"\n[OK] Archivo 3 generado en {duracion:.1f}s.")
     pausar()
 
 

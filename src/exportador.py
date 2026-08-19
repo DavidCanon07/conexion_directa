@@ -58,7 +58,16 @@ def _clasificar_columnas(df: pd.DataFrame) -> dict:
     return formatos
 
 
+_FILAS_MUESTRA_ANCHO = 2000  # suficiente para estimar el ancho de columna sin recorrer hojas de millones de filas
+
+
 def _anchos_columnas(df: pd.DataFrame) -> list:
+    # Ancho estimado con una MUESTRA de las primeras filas, no con el
+    # DataFrame completo: con hojas de cientos de miles o millones de
+    # filas (ej. archivos consolidados de 3-4 planos de ~1M filas cada
+    # uno), recorrer las 55 columnas completas solo para un ancho visual
+    # aproximado es un costo real. El ancho es cosmético, no afecta datos.
+    muestra = df.head(_FILAS_MUESTRA_ANCHO)
     anchos = []
     for col_name in df.columns:
         # fillna("") antes de astype(str): en pandas 3.x, astype(str) sobre
@@ -66,7 +75,7 @@ def _anchos_columnas(df: pd.DataFrame) -> list:
         # "coerce") no pudo convertir el valor) NO produce la cadena "nan"
         # como en pandas < 3 — deja el NaN como float, y map(len) revienta
         # con "object of type 'float' has no len()".
-        largo_max = df[col_name].fillna("").astype(str).map(len).max() if len(df) else 0
+        largo_max = muestra[col_name].fillna("").astype(str).map(len).max() if len(muestra) else 0
         largo_max = max(largo_max, len(str(col_name)))
         anchos.append(min(largo_max + 3, 40))
     return anchos
@@ -133,21 +142,31 @@ def _escribir_hoja_dataframe(wb, nombre_hoja: str, df: pd.DataFrame):
 
     columnas = list(df.columns)
     formato_por_columna = [formatos.get(col) for col in columnas]
+    # Posiciones que sí necesitan WriteOnlyCell con number_format —
+    # normalmente 1-2 de 55 (MONTO-1, a veces una columna de fecha). Tocar
+    # solo esas por fila, en vez de recorrer las 55 columnas en cada una,
+    # es la diferencia real con hojas de varios millones de filas (ej.
+    # consolidados de 3-4 archivos planos de ~1M filas cada uno).
+    indices_formato = [i for i, formato in enumerate(formato_por_columna) if formato]
 
     # NaN (ej. MONTO-1 no numérico tras pd.to_numeric(errors="coerce"))
     # se pasa como None para que quede como celda vacía, igual que
     # to_excel lo hacía automáticamente.
     valores = df.astype(object).where(df.notna(), None).values.tolist()
+
+    if not indices_formato:
+        for fila in valores:
+            ws.append(fila)
+        return
+
     for fila in valores:
-        fila_out = []
-        for valor, formato in zip(fila, formato_por_columna):
-            if formato and valor is not None:
+        for idx in indices_formato:
+            valor = fila[idx]
+            if valor is not None:
                 celda = WriteOnlyCell(ws, value=valor)
-                celda.number_format = formato
-                fila_out.append(celda)
-            else:
-                fila_out.append(valor)
-        ws.append(fila_out)
+                celda.number_format = formato_por_columna[idx]
+                fila[idx] = celda
+        ws.append(fila)
 
 
 def _escribir_hoja_libre(wb, nombre_hoja: str, celdas: list):
