@@ -14,8 +14,16 @@ celdas ya escritas — por eso el estilo (relleno de encabezado, negrita,
 formato de número) se define en el momento de crear cada WriteOnlyCell,
 antes de hacer ws.append(fila), en lugar de aplicarse en una pasada
 posterior sobre el worksheet ya escrito.
+
+Cualquier hoja tipo DataFrame que supere LIMITE_FILAS_HOJA filas se
+particiona automáticamente en varias hojas consecutivas antes de
+escribirse (ver _particionar_hoja_grande) — Excel tiene un límite real de
+1,048,576 filas por hoja; sin esto, un resultado de negocio de más de un
+millón de filas no cabría en una sola hoja y el .xlsx quedaría corrupto o
+Excel se saturaría al abrirlo.
 """
 
+import math
 from pathlib import Path
 
 import openpyxl
@@ -31,6 +39,7 @@ HEADER_FONT = Font(bold=True, color="FFFFFF")
 HEADER_ALIGN = Alignment(horizontal="center")
 FORMATO_MONEDA = "#,##0.00"
 FORMATO_FECHA = "DD/MM/YYYY"
+LIMITE_FILAS_HOJA = 1_000_000
 
 
 def _clasificar_columnas(df: pd.DataFrame) -> dict:
@@ -61,6 +70,42 @@ def _anchos_columnas(df: pd.DataFrame) -> list:
         largo_max = max(largo_max, len(str(col_name)))
         anchos.append(min(largo_max + 3, 40))
     return anchos
+
+
+def _particionar_hoja_grande(nombre_hoja: str, df: pd.DataFrame) -> dict:
+    """
+    Si df supera LIMITE_FILAS_HOJA filas, lo divide en tantas hojas
+    consecutivas de hasta LIMITE_FILAS_HOJA filas cada una como haga
+    falta (num_partes = ceil(filas / LIMITE_FILAS_HOJA)), sin reordenar
+    filas — solo bloques secuenciales — para que Excel (límite real:
+    1,048,576 filas por hoja, encabezado incluido) pueda abrir y reflejar
+    la salida completa sin saturarse. Las partes se nombran
+    "{nombre_hoja} (1)", "{nombre_hoja} (2)", etc., recortadas a 31
+    caracteres (límite de Excel para nombres de hoja) como resguardo,
+    aunque con los nombres de hoja actuales del proyecto nunca se acerca
+    a ese límite. Si df no supera LIMITE_FILAS_HOJA, se devuelve sin
+    cambios bajo su nombre original.
+    """
+    if len(df) <= LIMITE_FILAS_HOJA:
+        return {nombre_hoja: df}
+
+    num_partes = math.ceil(len(df) / LIMITE_FILAS_HOJA)
+    partes = {}
+    for i in range(num_partes):
+        inicio = i * LIMITE_FILAS_HOJA
+        fin = inicio + LIMITE_FILAS_HOJA
+        nombre_parte = f"{nombre_hoja} ({i + 1})"[:31]
+        partes[nombre_parte] = df.iloc[inicio:fin]
+
+    nombres_partes = ", ".join(f"'{n}'" for n in partes)
+    mensaje = (
+        f"   [i]  '{nombre_hoja}' superó {LIMITE_FILAS_HOJA:,} filas "
+        f"({len(df):,}) — dividida en {num_partes} hojas: {nombres_partes}."
+    )
+    print(mensaje)
+    logger.info(f"Hoja particionada: '{nombre_hoja}' ({len(df)} filas) -> {num_partes} partes")
+
+    return partes
 
 
 def _escribir_hoja_dataframe(wb, nombre_hoja: str, df: pd.DataFrame):
@@ -156,7 +201,10 @@ def guardar_con_formato(path: Path, hojas: dict) -> bool:
     Si algún DataFrame viene vacío (0 filas), igual se escribe la hoja
     con encabezados en lugar de fallar, pero se avisa explícitamente
     en consola y en el log — así el usuario no pasa por alto que un
-    filtro no encontró resultados.
+    filtro no encontró resultados. Si algún DataFrame supera
+    LIMITE_FILAS_HOJA filas, se particiona automáticamente en varias
+    hojas antes de escribir (ver _particionar_hoja_grande) — así ninguna
+    hoja de salida excede el límite real de Excel (1,048,576 filas).
 
     Devuelve True si el archivo se generó correctamente. Si algo falla
     (ej. el archivo está abierto en Excel), @manejar_errores captura el
@@ -169,8 +217,18 @@ def guardar_con_formato(path: Path, hojas: dict) -> bool:
         if isinstance(contenido, pd.DataFrame) and len(contenido) == 0
     ]
 
-    wb = openpyxl.Workbook(write_only=True)
+    # Particionar antes de escribir: una hoja particionada nunca está
+    # vacía (supera LIMITE_FILAS_HOJA filas), así que no hay conflicto
+    # con hojas_vacias, calculada arriba sobre los nombres originales.
+    hojas_expandidas = {}
     for nombre_hoja, contenido in hojas.items():
+        if isinstance(contenido, pd.DataFrame):
+            hojas_expandidas.update(_particionar_hoja_grande(nombre_hoja, contenido))
+        else:
+            hojas_expandidas[nombre_hoja] = contenido
+
+    wb = openpyxl.Workbook(write_only=True)
+    for nombre_hoja, contenido in hojas_expandidas.items():
         if isinstance(contenido, pd.DataFrame):
             _escribir_hoja_dataframe(wb, nombre_hoja, contenido)
         else:

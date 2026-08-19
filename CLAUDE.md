@@ -168,6 +168,12 @@ is unaware of file boundaries, only of the `"__dia"` column.
   quoted exactly as-is, never normalized: `" CODIGO-RESP"` (leading space),
   `"NUMEROS - CUOTAS "` (trailing space), `"COMISION -  FINANCIERA -
   ADQUIRIENTE"` (double internal space).
+- **Any output sheet over 1,000,000 rows gets auto-partitioned** into
+  `"{nombre} (1)"`, `"{nombre} (2)"`, etc. (`_particionar_hoja_grande` in
+  `src/exportador.py`, applied inside `guardar_con_formato` to every
+  DataFrame sheet from any of the 3 archivos) — Excel's real limit is
+  1,048,576 rows/sheet. This is a generic export-layer safeguard, not a
+  business rule — don't move it into `reglas.py`.
 - Large `*.txt` files at the repo root (`GOF.GRB.FM14.F260813.txt`,
   `GOF.GRB.FM14.F260814.txt` — real production naming, days 13/14) are
   sample flat-file inputs for manual testing, ~130+ MB each — don't read
