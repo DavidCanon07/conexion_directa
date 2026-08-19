@@ -4,177 +4,146 @@ Escribe DataFrames a .xlsx con formato legible: encabezado resaltado,
 ancho de columna automático, encabezado congelado y formato numérico/
 fecha según el nombre del campo.
 
-Las hojas tabulares (DataFrame) se escriben fila por fila con
-ws.append() en vez de DataFrame.to_excel(engine="openpyxl"): to_excel
-escribe celda por celda (ws.cell(row, col, value) por cada una de las
-~55 columnas x cada fila), que con cientos de miles de filas es
-sensiblemente más lento que anexar la fila completa de una vez. El
-ancho de columna y el formato de moneda/fecha se calculan en el mismo
-recorrido de escritura en vez de en pasadas adicionales sobre todo el
-DataFrame.
+Usa Workbook(write_only=True) en vez de pd.ExcelWriter: con hojas de
+decenas de miles de filas, escribir celda por celda vía openpyxl normal
+(el motor de to_excel) es el cuello de botella real de todo el programa,
+más lento que leer y parsear el archivo plano de origen. El modo
+write-only transmite cada fila directamente al XML sin mantener el
+worksheet completo en memoria, a costa de no poder releer/reposicionar
+celdas ya escritas — por eso el estilo (relleno de encabezado, negrita,
+formato de número) se define en el momento de crear cada WriteOnlyCell,
+antes de hacer ws.append(fila), en lugar de aplicarse en una pasada
+posterior sobre el worksheet ya escrito.
 """
 
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
-from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from utils import logger, manejar_errores
 
-_ANCHO_MAXIMO_COLUMNA = 40
-_FILAS_MUESTRA_ANCHO = 2000  # suficiente para estimar el ancho de columnas de texto sin recorrer todo el DataFrame
+HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+HEADER_ALIGN = Alignment(horizontal="center")
+FORMATO_MONEDA = "#,##0.00"
+FORMATO_FECHA = "DD/MM/YYYY"
 
 
-def _calcular_formato_y_ancho(df: pd.DataFrame) -> tuple:
+def _clasificar_columnas(df: pd.DataFrame) -> dict:
     """
-    Determina, por columna, el formato numérico (moneda/fecha por
-    substring del nombre) y el ancho de columna. Compartido entre el
-    escritor normal y el write_only: ambos necesitan lo mismo antes de
-    escribir el encabezado.
+    Determina, por nombre de columna, qué formato de número aplica
+    (moneda si el nombre contiene "monto"/"valor", fecha si contiene
+    "fecha"), igual que la clasificación previa por substring.
     """
-    formato_por_columna = {}
-    ancho_por_columna = {}
-    muestra = df.head(_FILAS_MUESTRA_ANCHO)
-
-    for col_idx, nombre in enumerate(df.columns, start=1):
-        nombre_min = str(nombre).lower()
-        if "monto" in nombre_min or "valor" in nombre_min:
-            formato_por_columna[col_idx] = "#,##0.00"
-            ancho_por_columna[col_idx] = 18
-        elif "fecha" in nombre_min:
-            formato_por_columna[col_idx] = "DD/MM/YYYY"
-            ancho_por_columna[col_idx] = 12
-        else:
-            largo_muestra = muestra[nombre].astype(str).map(len).max() if len(muestra) else 0
-            ancho_por_columna[col_idx] = min(max(largo_muestra, len(str(nombre))) + 3, _ANCHO_MAXIMO_COLUMNA)
-
-    return formato_por_columna, ancho_por_columna
+    formatos = {}
+    for col_name in df.columns:
+        nombre = str(col_name).lower()
+        if "monto" in nombre or "valor" in nombre:
+            formatos[col_name] = FORMATO_MONEDA
+        elif "fecha" in nombre:
+            formatos[col_name] = FORMATO_FECHA
+    return formatos
 
 
-def _formatear_hoja(ws, df: pd.DataFrame):
-    """
-    Escribe encabezado (resaltado + centrado), congela la fila 1 y
-    escribe los datos fila por fila. El ancho de columna se estima con
-    una muestra de las primeras filas (no con el DataFrame completo:
-    con cientos de miles de filas, astype(str).map(len) sobre cada
-    columna es un recorrido Python completo adicional y solo afecta el
-    ancho visual, no los datos ni los filtros). Las columnas de
-    moneda/fecha reciben un ancho fijo razonable en vez de muestreado,
-    ya que su formato numérico ya fija su longitud típica.
-    """
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
-    header_alignment = Alignment(horizontal="center")
+def _anchos_columnas(df: pd.DataFrame) -> list:
+    anchos = []
+    for col_name in df.columns:
+        # fillna("") antes de astype(str): en pandas 3.x, astype(str) sobre
+        # NaN en una columna float (ej. MONTO-1 cuando pd.to_numeric(errors=
+        # "coerce") no pudo convertir el valor) NO produce la cadena "nan"
+        # como en pandas < 3 — deja el NaN como float, y map(len) revienta
+        # con "object of type 'float' has no len()".
+        largo_max = df[col_name].fillna("").astype(str).map(len).max() if len(df) else 0
+        largo_max = max(largo_max, len(str(col_name)))
+        anchos.append(min(largo_max + 3, 40))
+    return anchos
 
-    columnas = list(df.columns)
-    formato_por_columna, ancho_por_columna = _calcular_formato_y_ancho(df)
 
-    ws.append(columnas)
-    for col_idx in range(1, len(columnas) + 1):
-        celda = ws.cell(row=1, column=col_idx)
-        celda.fill = header_fill
-        celda.font = header_font
-        celda.alignment = header_alignment
-        ws.column_dimensions[get_column_letter(col_idx)].width = ancho_por_columna[col_idx]
+def _escribir_hoja_dataframe(wb, nombre_hoja: str, df: pd.DataFrame):
+    ws = wb.create_sheet(nombre_hoja)
+
+    formatos = _clasificar_columnas(df)
+    anchos = _anchos_columnas(df)
+
+    # En modo write-only, freeze_panes y column_dimensions solo quedan en
+    # el .xlsx si se fijan ANTES del primer ws.append(): la hoja se
+    # transmite en streaming y esos atributos de cabecera del worksheet
+    # ya no se pueden tocar una vez empezaron a salir filas.
     ws.freeze_panes = "A2"
-
-    # Excel/openpyxl no aceptan NaN/NaT; to_excel los convertía a celda
-    # vacía automáticamente, aquí se reemplazan explícitamente por None.
-    datos = df.where(pd.notnull(df), None)
-
-    if not formato_por_columna:
-        for fila in datos.itertuples(index=False, name=None):
-            ws.append(fila)
-        return
-
-    fila_excel = 1
-    for fila in datos.itertuples(index=False, name=None):
-        ws.append(fila)
-        fila_excel += 1
-        for col_idx, formato in formato_por_columna.items():
-            ws.cell(row=fila_excel, column=col_idx).number_format = formato
-
-
-def _escribir_dataframe_write_only(ws, df: pd.DataFrame):
-    """
-    Equivalente a _formatear_hoja pero para una hoja del Workbook en
-    modo write_only (openpyxl.Workbook(write_only=True)): ese modo
-    transmite cada fila directo al XML de salida sin retener los
-    objetos Cell en memoria, en vez de acumularlos todos como hace un
-    Workbook normal. Con archivos de hasta 1 millón de filas concentradas
-    en pocas hojas grandes (ej. "TIPO 50", "TIPO 12-15"), retener todas
-    las celdas en memoria degrada el rendimiento de forma no lineal
-    (se midió: una hoja con ~3x más filas tardó en escribirse ~5x más
-    con Workbook normal) — write_only evita esa degradación.
-
-    Contrapartida: en modo write_only no se puede volver a tocar una
-    celda después de escribir su fila (ya se serializó), así que el
-    encabezado y el formato de moneda/fecha por celda deben construirse
-    ANTES de cada ws.append(), con WriteOnlyCell en vez de asignar
-    ws.cell(row, col).atributo después.
-    """
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
-    header_alignment = Alignment(horizontal="center")
-
-    columnas = list(df.columns)
-    formato_por_columna, ancho_por_columna = _calcular_formato_y_ancho(df)
-
-    # En modo write_only, freeze_panes solo se serializa si se asigna
-    # ANTES del primer ws.append() (comportamiento verificado en
-    # openpyxl 3.1.5) — después del primer append queda ignorado
-    # silenciosamente, sin error.
-    ws.freeze_panes = "A2"
-    for col_idx, ancho in ancho_por_columna.items():
+    for col_idx, ancho in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = ancho
 
-    encabezado = []
-    for nombre in columnas:
-        celda = WriteOnlyCell(ws, value=nombre)
-        celda.fill = header_fill
-        celda.font = header_font
-        celda.alignment = header_alignment
-        encabezado.append(celda)
-    ws.append(encabezado)
+    fila_header = []
+    for col_name in df.columns:
+        celda = WriteOnlyCell(ws, value=col_name)
+        celda.fill = HEADER_FILL
+        celda.font = HEADER_FONT
+        celda.alignment = HEADER_ALIGN
+        fila_header.append(celda)
+    ws.append(fila_header)
 
-    datos = df.where(pd.notnull(df), None)
+    columnas = list(df.columns)
+    formato_por_columna = [formatos.get(col) for col in columnas]
 
-    if not formato_por_columna:
-        for fila in datos.itertuples(index=False, name=None):
-            ws.append(fila)
-        return
+    # NaN (ej. MONTO-1 no numérico tras pd.to_numeric(errors="coerce"))
+    # se pasa como None para que quede como celda vacía, igual que
+    # to_excel lo hacía automáticamente.
+    valores = df.astype(object).where(df.notna(), None).values.tolist()
+    for fila in valores:
+        fila_out = []
+        for valor, formato in zip(fila, formato_por_columna):
+            if formato and valor is not None:
+                celda = WriteOnlyCell(ws, value=valor)
+                celda.number_format = formato
+                fila_out.append(celda)
+            else:
+                fila_out.append(valor)
+        ws.append(fila_out)
 
-    for fila in datos.itertuples(index=False, name=None):
-        fila_salida = list(fila)
-        for col_idx, formato in formato_por_columna.items():
-            celda = WriteOnlyCell(ws, value=fila_salida[col_idx - 1])
-            celda.number_format = formato
-            fila_salida[col_idx - 1] = celda
-        ws.append(fila_salida)
 
-
-def _escribir_hoja_libre(ws, celdas: list):
+def _escribir_hoja_libre(wb, nombre_hoja: str, celdas: list):
     """
     Escribe una hoja de posición libre (no tabular), a partir de una lista
     de celdas: [{"fila": int, "columna": "D", "valor": ..., "negrita": bool,
     "formato_numero": str|None}, ...]. Se usa para replicar layouts fijos
     (ej. la plantilla de VALOR CINTA) en vez de un DataFrame con encabezado.
+
+    write-only no permite direccionar celdas sueltas (ws["D3"]) como antes,
+    así que se arma una grilla completa desde la columna A hasta la última
+    columna usada (dejando huecos en None) y se manda fila por fila con
+    ws.append — las columnas conservan su letra real (D, E, F...) para que
+    la plantilla replicada no cambie de posición.
     """
+    ws = wb.create_sheet(nombre_hoja)
+    if not celdas:
+        return
+
+    # Igual que en _escribir_hoja_dataframe: column_dimensions debe fijarse
+    # antes del primer ws.append() en modo write-only.
+    columnas_usadas = {c["columna"] for c in celdas}
+    for col in columnas_usadas:
+        ws.column_dimensions[col].width = 24
+
+    max_fila = max(c["fila"] for c in celdas)
+    max_col = max(column_index_from_string(c["columna"]) for c in celdas)
+
+    grid = [[None] * max_col for _ in range(max_fila)]
     for celda_def in celdas:
-        celda = ws[f"{celda_def['columna']}{celda_def['fila']}"]
-        celda.value = celda_def["valor"]
+        celda = WriteOnlyCell(ws, value=celda_def["valor"])
         if celda_def.get("negrita"):
             celda.font = Font(bold=True)
         formato = celda_def.get("formato_numero")
         if formato:
             celda.number_format = formato
+        col_idx = column_index_from_string(celda_def["columna"]) - 1
+        grid[celda_def["fila"] - 1][col_idx] = celda
 
-    columnas_usadas = {c["columna"] for c in celdas}
-    for col in columnas_usadas:
-        ws.column_dimensions[col].width = 24
+    for fila in grid:
+        ws.append(fila)
 
 
 @manejar_errores
@@ -200,30 +169,12 @@ def guardar_con_formato(path: Path, hojas: dict) -> bool:
         if isinstance(contenido, pd.DataFrame) and len(contenido) == 0
     ]
 
-    # Workbook manual (no pd.ExcelWriter). Si TODAS las hojas son
-    # DataFrame (caso de Archivo 1 y Archivo 2, que nunca traen la hoja
-    # de posición libre) se usa Workbook(write_only=True): transmite
-    # cada fila al XML sin retenerla en memoria, y escala linealmente
-    # con hojas de cientos de miles de filas (ver _escribir_dataframe_write_only).
-    # Si alguna hoja es de posición libre (Archivo 3, "Hoja1") se necesita
-    # asignación aleatoria de celdas (ws["D3"] = ...), incompatible con
-    # write_only, así que se usa un Workbook normal para todo el libro.
-    todas_dataframes = all(isinstance(contenido, pd.DataFrame) for contenido in hojas.values())
-
-    if todas_dataframes:
-        wb = Workbook(write_only=True)
-        for nombre_hoja, contenido in hojas.items():
-            ws = wb.create_sheet(title=nombre_hoja)
-            _escribir_dataframe_write_only(ws, contenido)
-    else:
-        wb = Workbook()
-        wb.remove(wb.active)
-        for nombre_hoja, contenido in hojas.items():
-            ws = wb.create_sheet(title=nombre_hoja)
-            if isinstance(contenido, pd.DataFrame):
-                _formatear_hoja(ws, contenido)
-            else:
-                _escribir_hoja_libre(ws, contenido)
+    wb = openpyxl.Workbook(write_only=True)
+    for nombre_hoja, contenido in hojas.items():
+        if isinstance(contenido, pd.DataFrame):
+            _escribir_hoja_dataframe(wb, nombre_hoja, contenido)
+        else:
+            _escribir_hoja_libre(wb, nombre_hoja, contenido)
     wb.save(path)
 
     print(f"[OK] Generado: {path}")
