@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A small interactive CLI tool that parses a fixed-width flat file (bank card
 transaction records) and produces three formatted Excel reports. There is no
 package manager manifest (no requirements.txt/pyproject.toml) — dependencies
-are `pandas` and `openpyxl`, installed into whatever Python environment runs
-the script.
+are `pandas` and `XlsxWriter` (`pip install xlsxwriter`), installed into
+whatever Python environment runs the script. `openpyxl` was the export
+engine until it was replaced by XlsxWriter for performance (see
+`exportador.py`'s module docstring) — it is no longer a dependency.
 
 Two deeper reference docs live in `docs/` and are worth reading before
 making non-trivial changes:
@@ -91,13 +93,14 @@ src/config.py  →  src/lector.py  →  src/reglas.py  →  src/exportador.py
   `"Detalle Dinamicas <dia>"` gives the same breakdown per day. See "Multi-file
   selection" below for how day-splitting works.
 - **`exportador.py`** — `guardar_con_formato(path, hojas)` writes a sheets
-  dict to `.xlsx`. Each hoja can be a DataFrame (header styling, frozen
-  header row, auto column width, and number/date formatting inferred from
-  column name substrings — `"monto"`/`"valor"` → currency, `"fecha"` →
-  date) or a list of free-position cells (`_escribir_hoja_libre`, for fixed
-  layouts that aren't tabular). Writes empty DataFrame sheets (headers only)
-  rather than failing when a filter matches zero rows, and warns in
-  console + log.
+  dict to `.xlsx` using XlsxWriter (`constant_memory=True`). Each hoja can
+  be a DataFrame (header styling, frozen header row, auto column width,
+  and currency formatting inferred from column name substrings —
+  `"monto"`/`"valor"` only; `"fecha"` columns get no number format, see
+  "Key conventions" below) or a list of free-position cells
+  (`_escribir_hoja_libre`, for fixed layouts that aren't tabular). Writes
+  empty DataFrame sheets (headers only) rather than failing when a filter
+  matches zero rows, and warns in console + log.
 - **`validador.py`** — file picker (`seleccionar_archivos`, plural — Tk
   multi-select dialog with a comma-separated console fallback) and
   `extraer_dia(ruta)`, which parses the day out of the production filename
@@ -174,14 +177,28 @@ is unaware of file boundaries, only of the `"__dia"` column.
   DataFrame sheet from any of the 3 archivos) — Excel's real limit is
   1,048,576 rows/sheet. This is a generic export-layer safeguard, not a
   business rule — don't move it into `reglas.py`.
-- **`_escribir_hoja_dataframe` only wraps cells in `WriteOnlyCell` for the
-  columns in `indices_formato`** (precomputed once per sheet — normally
-  `MONTO-1` plus any `"fecha"`-named column), not all ~55 columns per row.
-  When adding a new formatted-column heuristic to `_clasificar_columnas`,
-  keep this pattern — looping every column per row is the real cost at
-  multi-million-row scale (consolidating 3-4 flat files of ~1M rows each).
-  `_anchos_columnas` similarly samples the first 2000 rows
-  (`_FILAS_MUESTRA_ANCHO`) instead of scanning the full DataFrame.
+- **The export engine is XlsxWriter (`constant_memory=True`), not
+  openpyxl** — chosen after a benchmark on synthetic data of the real
+  shape (55 columns, ~1.75M rows) showed it 2.52x faster than openpyxl's
+  `write_only` mode (348s vs 878s). `constant_memory` streams rows to
+  disk and enforces writing each row's cells in strictly increasing
+  column order — `_escribir_hoja_dataframe` exploits `indices_formato`
+  (precomputed once per sheet, normally just `MONTO-1`) to write each row
+  in `write_row()` chunks for the unformatted stretch and a single
+  `write()` call for the formatted cell, instead of iterating all ~55
+  columns per row or creating a wrapper object per formatted cell.
+  `use_zip64()` is enabled on every workbook — without it XlsxWriter
+  raises `FileSizeError` once the compressed `.xlsx` passes ~4GB, which is
+  real at multi-million-row scale. `_anchos_columnas` similarly samples
+  the first 2000 rows (`_FILAS_MUESTRA_ANCHO`) instead of scanning the
+  full DataFrame.
+- **`"fecha"`-named columns get no `number_format`** — confirmed dead
+  weight: `lector.py`/`reglas.py` never convert those fields to a real
+  date type, so a date `number_format` on a text cell has zero visual
+  effect in Excel, but still cost real write time under the old openpyxl
+  implementation. Only `"monto"`/`"valor"` columns get formatted
+  (currency). Don't reintroduce date formatting without first converting
+  the column to an actual date/datetime value.
 - **`main.py` prints a `HH:MM:SS` timestamp when reading starts and again
   right before "Aplicando reglas de negocio..."** (the moment filtering
   begins), plus elapsed time (`time.perf_counter()`) at the end of parsing
